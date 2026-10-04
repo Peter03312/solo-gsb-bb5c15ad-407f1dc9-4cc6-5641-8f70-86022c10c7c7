@@ -4,7 +4,7 @@ const path = require('path');
 const express = require('express');
 const db = require('./db');
 const geom = require('./geom');
-const { optimize } = require('./nest');
+const { optimizeRolls } = require('./nest');
 const { validateJobInput } = require('./validate');
 
 const app = express();
@@ -16,7 +16,12 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 function loadFull(jobId) {
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
   if (!job) return null;
-  const defects = db.prepare('SELECT id, x, y, w, h FROM defects WHERE job_id = ?').all(jobId);
+  const rolls = db
+    .prepare('SELECT * FROM rolls WHERE job_id = ? ORDER BY seq')
+    .all(jobId);
+  const defects = db
+    .prepare('SELECT id, roll_id, x, y, w, h FROM defects WHERE job_id = ? ORDER BY id')
+    .all(jobId);
   const types = db.prepare('SELECT * FROM piece_types WHERE job_id = ?').all(jobId);
   const placements = db
     .prepare(
@@ -25,45 +30,81 @@ function loadFull(jobId) {
        WHERE p.job_id = ? ORDER BY p.id`
     )
     .all(jobId);
-  return { job, defects, types, placements };
+  return { job, rolls, defects, types, placements };
 }
 
-/** 重算实际占用长度与方案状态（complete / partial / draft） */
-function recompute(jobId) {
+/**
+ * 重算各卷实际占用长度、启用状态与方案状态。
+ * 状态规则：全部排入=complete；有已排且有未排=partial；一件未排=draft（仅创建后、未优化过）。
+ * 一旦方案曾经优化（状态非 draft），即使全部被移回未排区也保持 partial，不回退 draft。
+ */
+function recompute(jobId, touch) {
   const cnt = db
     .prepare('SELECT COUNT(*) AS total, COALESCE(SUM(placed), 0) AS placed FROM placements WHERE job_id = ?')
     .get(jobId);
-  const ml = db
+  const rows = db
     .prepare(
-      `SELECT MAX(p.y + t.bh) AS ml FROM placements p
-       JOIN piece_types t ON t.id = p.piece_type_id
-       WHERE p.job_id = ? AND p.placed = 1`
+      `SELECT r.id, MAX(CASE WHEN p.placed = 1 THEN p.y + t.bh END) AS ml
+       FROM rolls r
+       LEFT JOIN placements p ON p.roll_id = r.id
+       LEFT JOIN piece_types t ON t.id = p.piece_type_id
+       WHERE r.job_id = ?
+       GROUP BY r.id
+       ORDER BY r.seq`
     )
-    .get(jobId).ml;
-  const used = ml == null ? 0 : ml;
+    .all(jobId);
+  let totalUsed = 0;
+  const updRoll = db.prepare('UPDATE rolls SET used = ?, used_length = ? WHERE id = ?');
+  for (const r of rows) {
+    const usedLength = r.ml == null ? 0 : r.ml;
+    updRoll.run(usedLength > 0 ? 1 : 0, usedLength, r.id);
+    totalUsed += usedLength;
+  }
   const cur = db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId).status;
   let status;
   if (cnt.placed === cnt.total) status = 'complete';
-  else status = cur === 'draft' ? 'draft' : 'partial';
-  db.prepare('UPDATE jobs SET used_length = ?, status = ? WHERE id = ?').run(used, status, jobId);
+  else if (cnt.placed > 0 || touch || cur === 'partial') status = 'partial';
+  else status = 'draft';
+  db.prepare('UPDATE jobs SET used_length = ?, status = ? WHERE id = ?').run(totalUsed, status, jobId);
 }
 
-/** 组装完整方案状态（API 返回） */
+/** 组装完整方案状态（API 返回；同时保留单卷旧字段） */
 function jobState(jobId) {
   const full = loadFull(jobId);
   if (!full) return null;
-  const { job, defects, types, placements } = full;
+  const { job, rolls, defects, types, placements } = full;
+  const rollList = rolls.map((r) => ({
+    id: r.id,
+    seq: r.seq,
+    label: r.label,
+    width: r.width,
+    length: r.length,
+    used: !!r.used,
+    usedLength: r.used_length,
+  }));
+  const firstRoll = rolls[0] || null;
   return {
     job: {
       id: job.id,
       name: job.name,
-      fabricWidth: job.fabric_width,
-      fabricLength: job.fabric_length,
+      fabricWidth: job.fabric_width,   // 旧字段：首卷宽度
+      fabricLength: job.fabric_length, // 旧字段：首卷长度
+      rollCount: rolls.length,
       status: job.status,
-      usedLength: job.used_length,
+      usedLength: job.used_length,     // 各卷占用长度之和（单卷时即原语义）
       createdAt: job.created_at,
     },
-    defects,
+    rolls: rollList,
+    // 旧字段：首卷瑕疵（旧客户端只看这一卷）
+    defects: defects
+      .filter((d) => !firstRoll || d.roll_id === firstRoll.id)
+      .map((d) => ({ id: d.id, x: d.x, y: d.y, w: d.w, h: d.h })),
+    defectsByRoll: rollList.map((r) => ({
+      rollId: r.id,
+      defects: defects
+        .filter((d) => d.roll_id === r.id)
+        .map((d) => ({ id: d.id, x: d.x, y: d.y, w: d.w, h: d.h })),
+    })),
     pieceTypes: types.map((t) => ({
       id: t.id,
       name: t.name,
@@ -76,6 +117,8 @@ function jobState(jobId) {
     placements: placements.map((p) => ({
       id: p.id,
       pieceTypeId: p.piece_type_id,
+      rollId: p.roll_id,
+      requiredRollId: p.required_roll_id,
       name: p.name,
       seq: p.seq,
       x: p.x,
@@ -86,10 +129,17 @@ function jobState(jobId) {
       allowRotate: !!p.allow_rotate,
       bw: p.bw,
       bh: p.bh,
+      reason: p.unplaced_reason || null,
     })),
     unplaced: placements
       .filter((p) => !p.placed)
-      .map((p) => ({ id: p.id, name: p.name, seq: p.seq })),
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        seq: p.seq,
+        rollId: p.required_roll_id,
+        reason: p.unplaced_reason || null,
+      })),
   };
 }
 
@@ -100,6 +150,7 @@ app.get('/api/jobs', (req, res) => {
     .prepare(
       `SELECT j.id, j.name, j.fabric_width AS fabricWidth, j.fabric_length AS fabricLength,
               j.status, j.used_length AS usedLength, j.created_at AS createdAt,
+              (SELECT COUNT(*) FROM rolls r WHERE r.job_id = j.id) AS rollCount,
               (SELECT COUNT(*) FROM placements p WHERE p.job_id = j.id) AS pieceCount
        FROM jobs j ORDER BY j.id DESC`
     )
@@ -115,17 +166,29 @@ app.post('/api/jobs', (req, res) => {
   const tx = db.transaction(() => {
     const info = db
       .prepare('INSERT INTO jobs (name, fabric_width, fabric_length) VALUES (?, ?, ?)')
-      .run(value.name, value.fabricWidth, value.fabricLength);
+      .run(value.name, value.rolls[0].width, value.rolls[0].length);
     const jobId = info.lastInsertRowid;
-    const insD = db.prepare('INSERT INTO defects (job_id, x, y, w, h) VALUES (?, ?, ?, ?, ?)');
-    for (const d of value.defects) insD.run(jobId, d.x, d.y, d.w, d.h);
+    const insR = db.prepare('INSERT INTO rolls (job_id, seq, label, width, length) VALUES (?, ?, ?, ?, ?)');
+    const rollIds = [];
+    value.rolls.forEach((r, i) => {
+      rollIds.push(insR.run(jobId, i + 1, r.label, r.width, r.length).lastInsertRowid);
+    });
+    const insD = db.prepare('INSERT INTO defects (job_id, roll_id, x, y, w, h) VALUES (?, ?, ?, ?, ?, ?)');
+    value.rolls.forEach((r, i) => {
+      for (const d of r.defects) insD.run(jobId, rollIds[i], d.x, d.y, d.w, d.h);
+    });
     const insT = db.prepare(
       'INSERT INTO piece_types (job_id, name, vertices, quantity, allow_rotate, bw, bh) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
-    const insP = db.prepare('INSERT INTO placements (job_id, piece_type_id, seq) VALUES (?, ?, ?)');
+    const insP = db.prepare(
+      'INSERT INTO placements (job_id, piece_type_id, seq, required_roll_id) VALUES (?, ?, ?, ?)'
+    );
     for (const p of value.pieces) {
-      const t = insT.run(jobId, p.name, JSON.stringify(p.vertices), p.quantity, p.allowRotate ? 1 : 0, p.bw, p.bh);
-      for (let s = 1; s <= p.quantity; s++) insP.run(jobId, t.lastInsertRowid, s);
+      const t = insT.run(
+        jobId, p.name, JSON.stringify(p.vertices), p.quantity, p.allowRotate ? 1 : 0, p.bw, p.bh
+      );
+      const reqRollId = p.requiredRollIndex == null ? null : rollIds[p.requiredRollIndex];
+      for (let s = 1; s <= p.quantity; s++) insP.run(jobId, t.lastInsertRowid, s, reqRollId);
     }
     return jobId;
   });
@@ -145,24 +208,32 @@ app.delete('/api/jobs/:id', (req, res) => {
   res.status(204).end();
 });
 
-/** 优化排样：锁定件与瑕疵固定，重新排入全部未锁定裁片 */
+/**
+ * 优化排样（多卷）：锁定件与各卷瑕疵固定，重新排入全部未锁定裁片。
+ * 目标：先尽量排入全部裁片，再减少启用卷数、再减少总占用长度（见 nest.optimizeRolls）。
+ */
 app.post('/api/jobs/:id/optimize', (req, res) => {
   const full = loadFull(Number(req.params.id));
   if (!full) return res.status(404).json({ error: '方案不存在' });
-  const { job, defects, types, placements } = full;
+  const { job, rolls, defects, types, placements } = full;
+  const rollIndexById = new Map(rolls.map((r, i) => [r.id, i]));
   const typeById = new Map(types.map((t) => [t.id, t]));
 
   const locked = placements.filter((p) => p.placed && p.locked);
   const rest = placements.filter((p) => !(p.placed && p.locked));
 
-  const result = optimize({
-    W: job.fabric_width,
-    L: job.fabric_length,
-    defects,
+  const result = optimizeRolls({
+    rolls: rolls.map((r) => ({
+      label: r.label,
+      W: r.width,
+      L: r.length,
+      defects: defects.filter((d) => d.roll_id === r.id),
+    })),
     locked: locked.map((p) => {
       const t = typeById.get(p.piece_type_id);
       return {
         key: p.id,
+        rollIndex: rollIndexById.get(p.roll_id),
         verts: JSON.parse(t.vertices),
         rot: p.rotation,
         x: p.x,
@@ -182,33 +253,54 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
         w: t.bw,
         h: t.bh,
         area: Math.abs(geom.area2(verts)) / 2,
+        requiredIndex: p.required_roll_id == null ? null : rollIndexById.get(p.required_roll_id),
       };
     }),
   });
 
   const lockedIds = new Set(locked.map((p) => p.id));
-  const upd = db.prepare('UPDATE placements SET x = ?, y = ?, rotation = ?, placed = 1, locked = 0 WHERE id = ?');
-  const clr = db.prepare('UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0 WHERE id = ?');
-  const status = result.unplaced.length === 0 ? 'complete' : 'partial';
+  const placedById = new Map(result.placements.map((pl) => [pl.key, pl]));
+  const reasonById = new Map(result.unplaced.map((u) => [u.key, u.reason]));
+  const upd = db.prepare(
+    'UPDATE placements SET roll_id = ?, x = ?, y = ?, rotation = ?, placed = 1, locked = 0, unplaced_reason = NULL WHERE id = ?'
+  );
+  const clr = db.prepare(
+    'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0, unplaced_reason = ? WHERE id = ?'
+  );
   const tx = db.transaction(() => {
     for (const pl of result.placements) {
-      if (lockedIds.has(pl.key)) continue; // 锁定件保持不动
-      upd.run(pl.x, pl.y, pl.rotation, pl.key);
+      if (lockedIds.has(pl.key)) continue; // 锁定件保持不动（含卷号与位置）
+      upd.run(rolls[pl.rollIndex].id, pl.x, pl.y, pl.rotation, pl.key);
     }
-    for (const u of result.unplaced) clr.run(u.key);
-    db.prepare('UPDATE jobs SET used_length = ?, status = ? WHERE id = ?').run(result.usedLength, status, job.id);
+    for (const [key, reason] of reasonById) {
+      clr.run(reason, key);
+    }
+    // 保险：结果中未出现且非锁定的件（理论上不存在）也清回未排区
+    for (const p of rest) {
+      if (!placedById.has(p.id) && !reasonById.has(p.id)) {
+        clr.run('优化器未能排入', p.id);
+      }
+    }
+    recompute(job.id, true); // 优化后即使有件未排也须标记为部分方案
   });
   tx();
   res.json(jobState(job.id));
 });
 
-/** 手动移动（或未排入件手动放入）：冲突时指出对象并保持原方案 */
+/**
+ * 手动移动 / 旋转 / 手动排入（可跨卷）：
+ *  - body.rollId 指定目标卷；省略时单卷方案=唯一卷，多卷方案=保持原卷
+ *  - 必用卷约束：目标卷必须等于必用卷
+ *  - 按目标卷布边、瑕疵及已排裁片精确校验；冲突时指出对象且原方案不变
+ *  - 锁定件须先解锁
+ */
 app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   const jobId = Number(req.params.id);
   const pid = Number(req.params.pid);
   const full = loadFull(jobId);
   if (!full) return res.status(404).json({ error: '方案不存在' });
-  const { job, defects, types, placements } = full;
+  const { job, rolls, defects, types, placements } = full;
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
   const placement = placements.find((p) => p.id === pid);
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
   const label = `裁片「${placement.name}#${placement.seq}」`;
@@ -216,6 +308,46 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   if (placement.locked) {
     return res.status(409).json({ error: `${label}已锁定，请先解锁再移动`, conflicts: [label] });
   }
+
+  // ---- 目标卷解析 ----
+  let targetRoll;
+  const bodyRollId = req.body ? req.body.rollId : undefined;
+  if (bodyRollId === undefined || bodyRollId === null) {
+    if (rolls.length === 1) targetRoll = rolls[0];
+    else if (placement.roll_id != null) targetRoll = rollById.get(placement.roll_id);
+    else {
+      return res.status(400).json({
+        error: `该方案有 ${rolls.length} 卷，跨卷移动必须在请求体中指定目标卷 rollId（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+  } else {
+    if (!Number.isInteger(bodyRollId)) {
+      return res.status(400).json({
+        error: `目标卷号无效：rollId 必须为系统返回的卷 id 整数（收到 "${bodyRollId}"）`,
+      });
+    }
+    targetRoll = rollById.get(bodyRollId);
+    if (!targetRoll) {
+      return res.status(400).json({
+        error: `目标卷不存在：方案中没有 rollId=${bodyRollId} 的卷（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+  }
+  if (!targetRoll) return res.status(400).json({ error: '无法确定目标卷' });
+
+  // ---- 必用卷约束 ----
+  if (placement.required_roll_id != null && placement.required_roll_id !== targetRoll.id) {
+    const req = rollById.get(placement.required_roll_id);
+    return res.status(409).json({
+      error: `${label}指定了必用卷「${req ? req.label : placement.required_roll_id}」，不能移动到卷「${targetRoll.label}」`,
+      conflicts: [`必用卷「${req ? req.label : placement.required_roll_id}」`],
+    });
+  }
+
   const { x, y, rotation } = req.body || {};
   if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(rotation)) {
     return res.status(400).json({ error: '位置与旋转角度必须为整数（x, y 单位 mm；rotation 为 0 或 180）' });
@@ -228,9 +360,11 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   }
   const w = placement.bw;
   const h = placement.bh;
-  if (x < 0 || y < 0 || x + w > job.fabric_width || y + h > job.fabric_length) {
+  if (x < 0 || y < 0 || x + w > targetRoll.width || y + h > targetRoll.length) {
     return res.status(409).json({
-      error: `${label}移动后超出布幅范围（位置需满足 0≤x≤${job.fabric_width - w}, 0≤y≤${job.fabric_length - h}），已保留原方案`,
+      error:
+        `${label}移动后超出卷「${targetRoll.label}」布边` +
+        `（位置需满足 0≤x≤${targetRoll.width - w}, 0≤y≤${targetRoll.length - h}，该卷 ${targetRoll.width}×${targetRoll.length}mm），已保留原方案`,
       conflicts: [label],
     });
   }
@@ -240,24 +374,26 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   const abs = geom.toAbsolute(verts, rotation, w, h, x, y);
 
   const conflicts = [];
-  for (const d of defects) {
+  for (const d of defects.filter((d) => d.roll_id === targetRoll.id)) {
     if (geom.polygonsInteriorOverlap(abs, geom.rectPoly(d.x, d.y, d.w, d.h))) {
-      conflicts.push(`瑕疵区#${d.id}（${d.x},${d.y} ${d.w}×${d.h}mm）`);
+      conflicts.push(`卷「${targetRoll.label}」瑕疵区#${d.id}（${d.x},${d.y} ${d.w}×${d.h}mm）`);
     }
   }
   for (const q of placements) {
-    if (q.id === pid || !q.placed) continue;
+    if (q.id === pid || !q.placed || q.roll_id !== targetRoll.id) continue;
     const qt = types.find((t) => t.id === q.piece_type_id);
     const qAbs = geom.toAbsolute(JSON.parse(qt.vertices), q.rotation, qt.bw, qt.bh, q.x, q.y);
     if (geom.polygonsInteriorOverlap(abs, qAbs)) {
-      conflicts.push(`裁片「${q.name}#${q.seq}」${q.locked ? '（已锁定）' : ''}`);
+      conflicts.push(`卷「${targetRoll.label}」裁片「${q.name}#${q.seq}」${q.locked ? '（已锁定）' : ''}`);
     }
   }
   if (conflicts.length > 0) {
     return res.status(409).json({ error: `${label}移动后与以下对象冲突，已保留原方案`, conflicts });
   }
 
-  db.prepare('UPDATE placements SET x = ?, y = ?, rotation = ?, placed = 1 WHERE id = ?').run(x, y, rotation, pid);
+  db.prepare(
+    'UPDATE placements SET roll_id = ?, x = ?, y = ?, rotation = ?, placed = 1, unplaced_reason = NULL WHERE id = ?'
+  ).run(targetRoll.id, x, y, rotation, pid);
   recompute(jobId);
   res.json(jobState(jobId));
 });
@@ -281,15 +417,66 @@ app.post('/api/jobs/:id/placements/:pid/lock', (req, res) => {
   res.json(jobState(jobId));
 });
 
-/** 移回未排区（同时解除锁定） */
+/** 移回未排区（同时解除锁定；保留必用卷约束） */
 app.post('/api/jobs/:id/placements/:pid/unplace', (req, res) => {
   const jobId = Number(req.params.id);
   const pid = Number(req.params.pid);
   const info = db
-    .prepare('UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0 WHERE id = ? AND job_id = ?')
+    .prepare(
+      'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0, unplaced_reason = NULL WHERE id = ? AND job_id = ?'
+    )
     .run(pid, jobId);
   if (info.changes === 0) return res.status(404).json({ error: '裁片不存在' });
   recompute(jobId);
+  res.json(jobState(jobId));
+});
+
+/**
+ * 设置 / 取消单件裁片的必用卷约束。
+ * body: { rollId } 指定必用卷（id 整数）；{ rollId: null } 取消。
+ * 无效卷号、宽度/长度容不下裁片的必用卷约束一律拒绝（400）。
+ * 已排入件的卷不会因此自动改变；已锁定件同样只改约束，需重新优化/手动移动才生效。
+ */
+app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
+  const jobId = Number(req.params.id);
+  const pid = Number(req.params.pid);
+  const full = loadFull(jobId);
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  const { rolls, types, placements } = full;
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
+  const placement = placements.find((p) => p.id === pid);
+  if (!placement) return res.status(404).json({ error: '裁片不存在' });
+  const label = `裁片「${placement.name}#${placement.seq}」`;
+
+  const raw = req.body ? req.body.rollId : undefined;
+  if (raw !== null && raw !== undefined && !Number.isInteger(raw)) {
+    return res.status(400).json({ error: 'rollId 必须为卷 id 整数，或用 null 取消必用卷约束' });
+  }
+  let target = null;
+  if (raw !== null && raw !== undefined) {
+    target = rollById.get(raw);
+    if (!target) {
+      return res.status(400).json({
+        error: `卷号无效：方案中没有 rollId=${raw} 的卷（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+    if (placement.bw > target.width || placement.bh > target.length) {
+      return res.status(400).json({
+        error:
+          `${label}外接尺寸 ${placement.bw}×${placement.bh}mm 超过必用卷「${target.label}」` +
+          `（${target.width}×${target.length}mm），必用卷约束不可能满足，已拒绝`,
+      });
+    }
+  }
+
+  // 仅作用于这一件裁片（创建时按型号统一设置；创建后每件可单独调整）
+  db.prepare('UPDATE placements SET required_roll_id = ? WHERE id = ? AND job_id = ?').run(
+    target ? target.id : null,
+    pid,
+    jobId
+  );
   res.json(jobState(jobId));
 });
 
@@ -307,6 +494,10 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-  console.log(`布料裁片排样系统已启动：http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`布料裁片排样系统已启动：http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

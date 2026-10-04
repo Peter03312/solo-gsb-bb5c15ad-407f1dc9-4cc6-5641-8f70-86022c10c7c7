@@ -39,15 +39,32 @@ button.danger { background: #c62828; border-color: #c62828; color: #fff; }
 button.mini { padding: 1px 8px; font-size: 12px; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.defect-row, .piece-card { border: 1px dashed #bbb; border-radius: 4px; padding: 6px; margin: 6px 0; }
+.defect-row, .piece-card, .roll-card { border: 1px dashed #bbb; border-radius: 4px; padding: 6px; margin: 6px 0; }
 .defect-row { display: flex; gap: 4px; align-items: center; }
 .defect-row input { width: 58px; padding: 3px 4px; }
 .defect-row .lbl { font-size: 12px; color: #777; }
+.roll-card { border-style: solid; border-color: #90a4ae; background: #f7fafb; }
+.roll-head { display: flex; gap: 6px; align-items: center; }
+.roll-head .roll-label { flex: 1; padding: 4px 6px; font-weight: 600; }
+.roll-dims { display: flex; gap: 10px; align-items: center; margin: 6px 0 2px; font-size: 13px; }
+.roll-dims input { width: 80px; padding: 3px 4px; }
+.roll-defects .defect-row { background: #fff; }
 .piece-card input[type=text] { width: 100%; margin-bottom: 4px; padding: 4px 6px; }
 .piece-card textarea { width: 100%; height: 76px; font-family: monospace; font-size: 12px; padding: 4px 6px; }
 .piece-card .sub { display: flex; gap: 10px; align-items: center; margin-top: 4px; font-size: 13px; }
 .piece-card .sub input[type=number] { width: 64px; }
+.piece-card .reqrow { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 13px; color: #555; }
+.piece-card .reqrow select { flex: 1; padding: 3px 4px; }
 .hint { font-size: 12px; color: #888; }
+
+#rollTabs { display: none; gap: 6px; flex-wrap: wrap; padding: 6px 12px 0; }
+#rollTabs.show { display: flex; }
+.rolltab { text-align: left; padding: 4px 10px; border: 1px solid #b0bec5; border-radius: 6px; background: #f2f6f8; }
+.rolltab.active { background: #1565c0; border-color: #1565c0; color: #fff; }
+.rolltab .dim { font-size: 11px; opacity: 0.75; margin-left: 4px; }
+.rolltab .ulen { display: block; font-size: 11px; color: #2e7d32; }
+.rolltab .idle { display: block; font-size: 11px; color: #999; }
+.rolltab.active .ulen, .rolltab.active .idle { color: #d7ecff; }
 
 #workspace { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #toolbar {

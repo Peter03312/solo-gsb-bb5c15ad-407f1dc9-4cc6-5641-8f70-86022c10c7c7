@@ -7,12 +7,13 @@ const cv = $('cv');
 const ctx = cv.getContext('2d');
 const PAD = 36; // 画布留白 px
 
-let state = null;        // 当前方案完整状态（GET /api/jobs/:id 返回）
-let scale = 0.25;        // px / mm
-let selectedId = null;   // 选中的 placement id
-let drag = null;         // 拖拽状态
-let defectRows = [];     // 新建表单：瑕疵区行
-let pieceRows = [];      // 新建表单：裁片卡片
+let state = null;          // 当前方案完整状态（GET /api/jobs/:id 返回）
+let scale = 0.25;          // px / mm
+let selectedId = null;     // 选中的 placement id
+let currentRollId = null;  // 画布当前查看的卷 id
+let drag = null;           // 拖拽状态
+let rollCards = [];        // 新建表单：布卷卡片
+let pieceRows = [];        // 新建表单：裁片卡片
 
 const PALETTE = [
   '#f4a261', '#2a9d8f', '#e9c46a', '#8ab17d', '#577590',
@@ -67,7 +68,7 @@ async function refreshJobList(selectId) {
   for (const j of jobs) {
     const opt = document.createElement('option');
     opt.value = j.id;
-    opt.textContent = `#${j.id} ${j.name}（${j.fabricWidth}×${j.fabricLength}mm，${j.pieceCount}件）`;
+    opt.textContent = `#${j.id} ${j.name}（${j.rollCount || 1}卷，${j.pieceCount}件）`;
     sel.appendChild(opt);
   }
   if (selectId) sel.value = String(selectId);
@@ -76,23 +77,38 @@ async function refreshJobList(selectId) {
 async function openJob(id) {
   state = await api('GET', `/api/jobs/${id}`);
   selectedId = null;
+  if (!state.rolls.some((r) => r.id === currentRollId)) {
+    currentRollId = state.rolls.length ? state.rolls[0].id : null;
+  }
   showMsg('', false);
   fitScale();
   renderAll();
+}
+
+function currentRoll() {
+  return state ? state.rolls.find((r) => r.id === currentRollId) || state.rolls[0] : null;
+}
+
+function defectsOf(rollId) {
+  const entry = state.defectsByRoll.find((d) => d.rollId === rollId);
+  return entry ? entry.defects : [];
 }
 
 /* ================= 渲染 ================= */
 
 function fitScale() {
   if (!state) return;
+  const r = currentRoll();
+  if (!r) return;
   const wrap = $('canvasWrap');
-  const s = (wrap.clientWidth - PAD * 2 - 20) / state.job.fabricWidth;
-  scale = Math.min(s, 30000 / state.job.fabricLength, 4);
+  const s = (wrap.clientWidth - PAD * 2 - 20) / r.width;
+  scale = Math.min(s, 30000 / r.length, 4);
   scale = Math.max(scale, 0.005);
 }
 
 function renderAll() {
   renderToolbar();
+  renderRollTabs();
   renderUnplaced();
   renderSelPanel();
   setupCanvas();
@@ -123,7 +139,27 @@ function renderToolbar() {
     badge.textContent = '草稿（尚未优化）';
     badge.className = 'badge draft';
   }
-  used.textContent = `实际占用长度：${state.job.usedLength} mm`;
+  const nUsed = state.rolls.filter((r) => r.used).length;
+  used.textContent = `启用 ${nUsed}/${state.rolls.length} 卷；总占用 ${state.job.usedLength} mm`;
+}
+
+function renderRollTabs() {
+  const el = $('rollTabs');
+  el.innerHTML = '';
+  if (!state || state.rolls.length <= 1) return; // 单卷（含旧数据）不显示卷切换
+  for (const r of state.rolls) {
+    const tab = document.createElement('button');
+    tab.className = 'rolltab' + (r.id === currentRollId ? ' active' : '');
+    tab.innerHTML =
+      `${r.seq}. ${r.label} <span class="dim">${r.width}×${r.length}mm</span>` +
+      (r.used ? `<span class="ulen">占用 ${r.usedLength}mm</span>` : '<span class="idle">未启用</span>');
+    tab.onclick = () => {
+      currentRollId = r.id;
+      fitScale();
+      renderAll();
+    };
+    el.appendChild(tab);
+  }
 }
 
 function renderUnplaced() {
@@ -138,7 +174,9 @@ function renderUnplaced() {
   for (const u of state.unplaced) {
     const chip = document.createElement('span');
     chip.className = 'chip' + (u.id === selectedId ? ' sel' : '');
-    chip.textContent = `${u.name}#${u.seq}`;
+    const req = u.rollId ? state.rolls.find((r) => r.id === u.rollId) : null;
+    chip.textContent = `${u.name}#${u.seq}${req ? '（必用:' + req.label + '）' : ''}`;
+    chip.title = u.reason || '未排入';
     chip.onclick = () => {
       selectedId = u.id;
       renderAll();
@@ -147,12 +185,29 @@ function renderUnplaced() {
   }
   const tip = document.createElement('div');
   tip.className = 'hint';
-  tip.textContent = '点击裁片可在左侧输入坐标手动排入，或调整布幅/锁定件后重新优化。';
+  tip.textContent = '点击裁片可在左侧选目标卷并输入坐标手动排入，或调整卷/锁定件后重新优化。';
   el.appendChild(tip);
 }
 
 function findPlacement(id) {
   return state ? state.placements.find((p) => p.id === id) : null;
+}
+
+function rollSelectOptions(select, selectedId, includeAny) {
+  select.innerHTML = '';
+  if (includeAny) {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = '不限卷（自动选择）';
+    select.appendChild(o);
+  }
+  for (const r of state.rolls) {
+    const o = document.createElement('option');
+    o.value = r.id;
+    o.textContent = `${r.seq}. ${r.label}（${r.width}×${r.length}mm${r.used ? '，占用' + r.usedLength + 'mm' : ''}）`;
+    select.appendChild(o);
+  }
+  select.value = selectedId == null ? '' : String(selectedId);
 }
 
 function renderSelPanel() {
@@ -163,26 +218,29 @@ function renderSelPanel() {
     return;
   }
   panel.style.display = 'block';
+  const roll = p.rollId ? state.rolls.find((r) => r.id === p.rollId) : null;
+  const reqRoll = p.requiredRollId ? state.rolls.find((r) => r.id === p.requiredRollId) : null;
   $('selInfo').innerHTML =
     `<b>${p.name}#${p.seq}</b>　外接 ${p.bw}×${p.bh}mm　` +
-    (p.placed ? `当前 (${p.x}, ${p.y}) ${p.rotation}°` : '<span style="color:#ef6c00">未排入</span>') +
-    (p.locked ? '　🔒已锁定' : '');
+    (p.placed
+      ? `卷「${roll.label}」卷内 (${p.x}, ${p.y}) ${p.rotation}°`
+      : '<span style="color:#ef6c00">未排入</span>' + (p.reason ? `（${p.reason}）` : '')) +
+    (p.locked ? '　🔒已锁定' : '') +
+    (reqRoll ? `　必用卷：${reqRoll.label}` : '');
+  // 目标卷（默认当前所在卷；未排件默认必用卷或当前查看卷）
+  const targetRollId = p.rollId || p.requiredRollId || currentRollId;
+  rollSelectOptions($('selRoll'), targetRollId, false);
   $('selX').value = p.placed ? p.x : 0;
   $('selY').value = p.placed ? p.y : 0;
   $('selRot').value = String(p.rotation);
   $('selRot').querySelector('option[value="180"]').disabled = !p.allowRotate;
+  // 必用卷选择器
+  rollSelectOptions($('selReqRoll'), p.requiredRollId, true);
   $('selLocked').checked = p.locked;
   $('selLocked').disabled = !p.placed;
 }
 
 /* ================= 画布 ================= */
-
-function absVertsOf(p) {
-  const t = state.pieceTypes.find((t) => t.id === p.pieceTypeId);
-  const vs = t.vertices;
-  if (p.rotation === 180) return vs.map(([x, y]) => [p.x + t.bw - x, p.y + t.bh - y]);
-  return vs.map(([x, y]) => [p.x + x, p.y + y]);
-}
 
 function setupCanvas() {
   if (!state) {
@@ -190,8 +248,9 @@ function setupCanvas() {
     cv.height = 10;
     return;
   }
-  const cssW = state.job.fabricWidth * scale + PAD * 2;
-  const cssH = state.job.fabricLength * scale + PAD * 2;
+  const r = currentRoll();
+  const cssW = r.width * scale + PAD * 2;
+  const cssH = r.length * scale + PAD * 2;
   const dpr = window.devicePixelRatio || 1;
   cv.style.width = cssW + 'px';
   cv.style.height = cssH + 'px';
@@ -205,8 +264,9 @@ function mmY(y) { return PAD + y * scale; }
 
 function draw() {
   if (!state) return;
-  const W = state.job.fabricWidth;
-  const L = state.job.fabricLength;
+  const r = currentRoll();
+  const W = r.width;
+  const L = r.length;
   const cssW = W * scale + PAD * 2;
   const cssH = L * scale + PAD * 2;
   ctx.clearRect(0, 0, cssW, cssH);
@@ -217,6 +277,12 @@ function draw() {
   ctx.strokeStyle = '#333';
   ctx.lineWidth = 1.5;
   ctx.strokeRect(mmX(0), mmY(0), W * scale, L * scale);
+
+  // 卷名标注
+  ctx.fillStyle = '#777';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(`卷 ${r.seq}：${r.label}（${W}×${L}mm）`, mmX(0), mmY(0) - 10);
 
   // 网格与标尺
   const step = scale * 100 >= 8 ? 100 : scale * 500 >= 8 ? 500 : 1000;
@@ -235,8 +301,8 @@ function draw() {
     for (let x = 0; x <= W; x += 500) ctx.fillText(String(x), mmX(x) + 2, mmY(0) - 4);
   }
 
-  // 瑕疵区
-  for (const d of state.defects) {
+  // 当前卷瑕疵区
+  for (const d of defectsOf(r.id)) {
     ctx.fillStyle = 'rgba(229,57,53,0.30)';
     ctx.fillRect(mmX(d.x), mmY(d.y), d.w * scale, d.h * scale);
     ctx.strokeStyle = '#c62828';
@@ -249,13 +315,13 @@ function draw() {
     }
   }
 
-  // 裁片
+  // 当前卷裁片
   for (const p of state.placements) {
-    if (!p.placed) continue;
+    if (!p.placed || p.rollId !== r.id) continue;
     const isDrag = drag && drag.pid === p.id && drag.moved;
     const px = isDrag ? drag.curX : p.x;
     const py = isDrag ? drag.curY : p.y;
-    const t = state.pieceTypes.find((t) => t.id === p.pieceTypeId);
+    const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
     const vs = t.vertices.map(([x, y]) =>
       p.rotation === 180 ? [px + t.bw - x, py + t.bh - y] : [px + x, py + y]
     );
@@ -270,7 +336,6 @@ function draw() {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // 标签
     const cx = vs.reduce((s, v) => s + v[0], 0) / vs.length;
     const cy = vs.reduce((s, v) => s + v[1], 0) / vs.length;
     if (p.bw * scale > 44 && p.bh * scale > 13) {
@@ -286,23 +351,23 @@ function draw() {
     }
   }
 
-  // 实际占用长度线
-  if (state.job.usedLength > 0) {
+  // 当前卷实际占用长度线
+  if (r.usedLength > 0) {
     ctx.strokeStyle = '#2e7d32';
     ctx.lineWidth = 1.5;
     ctx.setLineDash([8, 4]);
     ctx.beginPath();
-    ctx.moveTo(mmX(0), mmY(state.job.usedLength));
-    ctx.lineTo(mmX(W), mmY(state.job.usedLength));
+    ctx.moveTo(mmX(0), mmY(r.usedLength));
+    ctx.lineTo(mmX(W), mmY(r.usedLength));
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = '#2e7d32';
     ctx.font = '11px sans-serif';
-    ctx.fillText(`占用长度 ${state.job.usedLength}mm`, mmX(4), mmY(state.job.usedLength) - 4);
+    ctx.fillText(`本卷占用 ${r.usedLength}mm`, mmX(4), mmY(r.usedLength) - 4);
   }
 }
 
-/* ================= 画布交互 ================= */
+/* ================= 画布交互（卷内拖拽） ================= */
 
 function toMm(e) {
   const r = cv.getBoundingClientRect();
@@ -319,14 +384,21 @@ function pointInPoly(px, py, vs) {
   return inside;
 }
 
+function absVertsOf(p) {
+  const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
+  return t.vertices.map(([x, y]) =>
+    p.rotation === 180 ? [p.x + t.bw - x, p.y + t.bh - y] : [p.x + x, p.y + y]
+  );
+}
+
 cv.addEventListener('mousedown', (e) => {
   if (!state || e.button !== 0) return;
+  const r = currentRoll();
   const [mx, my] = toMm(e);
-  // 从最上层开始命中检测
-  const placed = state.placements.filter((p) => p.placed);
+  const placed = state.placements.filter((p) => p.placed && p.rollId === r.id);
   for (let i = placed.length - 1; i >= 0; i--) {
     const p = placed[i];
-    const t = state.pieceTypes.find((t) => t.id === p.pieceTypeId);
+    const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
     if (mx < p.x || mx > p.x + t.bw || my < p.y || my > p.y + t.bh) continue;
     if (!pointInPoly(mx, my, absVertsOf(p))) continue;
     selectedId = p.id;
@@ -353,7 +425,7 @@ cv.addEventListener('mousedown', (e) => {
 window.addEventListener('mousemove', (e) => {
   if (!drag) return;
   if (!drag.moved && Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 3) return;
-  if (drag.locked) return; // 锁定件不可拖动
+  if (drag.locked) return;
   drag.moved = true;
   const [mx, my] = toMm(e);
   drag.curX = Math.round(mx - drag.grabDX);
@@ -365,7 +437,7 @@ window.addEventListener('mouseup', async () => {
   if (!drag) return;
   const d = drag;
   drag = null;
-  if (!d.moved) { draw(); return; } // 视为点击选择
+  if (!d.moved) { draw(); return; }
   if (d.locked) {
     showMsg('该裁片已锁定，请先在左侧面板解锁再移动。', true);
     draw();
@@ -374,13 +446,14 @@ window.addEventListener('mouseup', async () => {
   const p = findPlacement(d.pid);
   try {
     state = await api('POST', `/api/jobs/${state.job.id}/placements/${d.pid}/move`, {
+      rollId: p.rollId, // 拖拽为卷内移动；跨卷请在左侧面板选目标卷
       x: d.curX, y: d.curY, rotation: p.rotation,
     });
     showMsg('移动成功。', false);
     renderAll();
   } catch (err) {
     showApiError(err, '移动被拒绝，已保留原方案');
-    renderAll(); // 服务端未改动，重绘回原位置
+    renderAll();
   }
 });
 
@@ -392,10 +465,11 @@ $('btnOptimize').onclick = async () => {
   try {
     state = await api('POST', `/api/jobs/${state.job.id}/optimize`);
     const n = state.unplaced.length;
+    const nUsed = state.rolls.filter((r) => r.used).length;
     showMsg(
       n === 0
-        ? `优化完成：全部裁片已排入，实际占用长度 ${state.job.usedLength}mm。`
-        : `优化结束：${n} 件无法排入（见下方列表），当前为部分方案，占用长度 ${state.job.usedLength}mm。`,
+        ? `优化完成：全部裁片已排入，启用 ${nUsed}/${state.rolls.length} 卷，总占用长度 ${state.job.usedLength}mm。`
+        : `优化结束：${n} 件无法排入（见下方列表），当前为部分方案，启用 ${nUsed} 卷，总占用 ${state.job.usedLength}mm。`,
       n !== 0
     );
     renderAll();
@@ -405,7 +479,11 @@ $('btnOptimize').onclick = async () => {
   }
 };
 
-$('btnZoomIn').onclick = () => { scale = Math.min(scale * 1.25, 4, 30000 / (state ? state.job.fabricLength : 1)); setupCanvas(); draw(); };
+$('btnZoomIn').onclick = () => {
+  const r = currentRoll();
+  scale = Math.min(scale * 1.25, 4, r ? 30000 / r.length : 1);
+  setupCanvas(); draw();
+};
 $('btnZoomOut').onclick = () => { scale = Math.max(scale / 1.25, 0.005); setupCanvas(); draw(); };
 
 $('btnApplyMove').onclick = async () => {
@@ -413,6 +491,7 @@ $('btnApplyMove').onclick = async () => {
   if (!p) return;
   try {
     state = await api('POST', `/api/jobs/${state.job.id}/placements/${p.id}/move`, {
+      rollId: Number($('selRoll').value),
       x: Number($('selX').value),
       y: Number($('selY').value),
       rotation: Number($('selRot').value),
@@ -421,6 +500,22 @@ $('btnApplyMove').onclick = async () => {
     renderAll();
   } catch (err) {
     showApiError(err, '操作被拒绝，已保留原方案');
+    renderAll();
+  }
+};
+
+$('selReqRoll').onchange = async () => {
+  const p = findPlacement(selectedId);
+  if (!p) return;
+  const v = $('selReqRoll').value;
+  try {
+    state = await api('POST', `/api/jobs/${state.job.id}/placements/${p.id}/require-roll`, {
+      rollId: v === '' ? null : Number(v),
+    });
+    showMsg(v === '' ? '已取消必用卷约束。' : '必用卷已设置（重新优化后生效）。', false);
+    renderAll();
+  } catch (err) {
+    showApiError(err, '必用卷设置被拒绝');
     renderAll();
   }
 };
@@ -465,6 +560,7 @@ $('btnDeleteJob').onclick = async () => {
   await api('DELETE', `/api/jobs/${id}`);
   state = null;
   selectedId = null;
+  currentRollId = null;
   await refreshJobList();
   renderAll();
   setupCanvas();
@@ -473,7 +569,22 @@ $('btnDeleteJob').onclick = async () => {
 
 /* ================= 新建方案表单 ================= */
 
-function addDefectRow(d) {
+function refreshPieceRollOptions() {
+  for (const card of pieceRows) {
+    const sel = card.reqSel;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">不限卷</option>';
+    rollCards.forEach((c, i) => {
+      const o = document.createElement('option');
+      o.value = String(i + 1);
+      o.textContent = `${i + 1}. ${c.labelInput.value || '卷' + (i + 1)}`;
+      sel.appendChild(o);
+    });
+    sel.value = cur;
+  }
+}
+
+function addDefectRow(container, d) {
   const row = document.createElement('div');
   row.className = 'defect-row';
   row.innerHTML =
@@ -486,12 +597,63 @@ function addDefectRow(d) {
   const data = d || { x: 0, y: 0, w: 100, h: 100 };
   inputs[0].value = data.x; inputs[1].value = data.y;
   inputs[2].value = data.w; inputs[3].value = data.h;
-  row.querySelector('button').onclick = () => {
-    defectRows = defectRows.filter((r) => r.el !== row);
-    row.remove();
+  row.querySelector('button').onclick = () => row.remove();
+  container.appendChild(row);
+  return { el: row, inputs };
+}
+
+function addRollCard(roll) {
+  const card = document.createElement('div');
+  card.className = 'roll-card';
+  card.innerHTML =
+    '<div class="roll-head">' +
+    '<input type="text" class="roll-label" placeholder="卷号，如：A卷">' +
+    '<button class="mini btn-del-roll">删卷</button>' +
+    '</div>' +
+    '<div class="roll-dims">' +
+    '<label>宽 <input type="number" class="roll-w" min="1" step="1"></label>' +
+    '<label>长 <input type="number" class="roll-l" min="1" step="1"></label>' +
+    '<button class="mini btn-add-defect">＋瑕疵</button>' +
+    '</div>' +
+    '<div class="roll-defects"></div>';
+  $('rollList').appendChild(card);
+  const rec = {
+    el: card,
+    labelInput: card.querySelector('.roll-label'),
+    wInput: card.querySelector('.roll-w'),
+    lInput: card.querySelector('.roll-l'),
+    defectBox: card.querySelector('.roll-defects'),
+    defectRows: [],
   };
-  $('defectList').appendChild(row);
-  defectRows.push({ el: row, inputs });
+  const addDefect = (d) => rec.defectRows.push(addDefectRow(rec.defectBox, d));
+  card.querySelector('.btn-add-defect').onclick = () => addDefect();
+  if (roll) {
+    rec.labelInput.value = roll.label || '';
+    rec.wInput.value = roll.width;
+    rec.lInput.value = roll.length;
+    (roll.defects || []).forEach(addDefect);
+  } else {
+    rec.wInput.value = 1600;
+    rec.lInput.value = 5000;
+    addDefect();
+  }
+  card.querySelector('.btn-del-roll').onclick = () => {
+    const idx = rollCards.indexOf(rec);
+    rollCards.splice(idx, 1);
+    card.remove();
+    // 删除中间卷会改变序号映射：>idx 的必用选择前移一位，等于 idx 的回到“不限卷”
+    for (const pc of pieceRows) {
+      const v = pc.reqSel.value;
+      refreshPieceRollOptions();
+      if (v === String(idx + 1)) pc.reqSel.value = '';
+      else if (v !== '' && Number(v) > idx + 1) pc.reqSel.value = String(Number(v) - 1);
+    }
+    refreshPieceRollOptions();
+  };
+  rec.labelInput.addEventListener('input', refreshPieceRollOptions);
+  rollCards.push(rec);
+  refreshPieceRollOptions();
+  return rec;
 }
 
 function addPieceCard(p) {
@@ -504,11 +666,13 @@ function addPieceCard(p) {
     '<label>件数 <input type="number" min="1" step="1" value="1"></label>' +
     '<label><input type="checkbox"> 允许旋转180°</label>' +
     '<button class="mini">删</button>' +
-    '</div>';
-  const [nameInput] = [card.querySelector('input[type=text]')];
+    '</div>' +
+    '<label class="reqrow">必用卷 <select class="reqroll"><option value="">不限卷</option></select></label>';
+  const nameInput = card.querySelector('input[type=text]');
   const ta = card.querySelector('textarea');
   const qty = card.querySelector('input[type=number]');
   const rot = card.querySelector('input[type=checkbox]');
+  const reqSel = card.querySelector('select.reqroll');
   if (p) {
     nameInput.value = p.name;
     ta.value = p.verts;
@@ -520,7 +684,9 @@ function addPieceCard(p) {
     card.remove();
   };
   $('pieceList').appendChild(card);
-  pieceRows.push({ el: card, nameInput, ta, qty, rot });
+  pieceRows.push({ el: card, nameInput, ta, qty, rot, reqSel });
+  refreshPieceRollOptions();
+  if (p && p.requiredRoll) reqSel.value = String(p.requiredRoll);
 }
 
 function parseVertices(text) {
@@ -541,22 +707,25 @@ function parseVertices(text) {
   return pts;
 }
 
-$('btnAddDefect').onclick = () => addDefectRow();
+$('btnAddRoll').onclick = () => addRollCard();
 $('btnAddPiece').onclick = () => addPieceCard();
 
 $('btnSample').onclick = () => {
-  $('fName').value = '示例方案';
-  $('fWidth').value = 1600;
-  $('fLength').value = 5000;
-  defectRows.forEach((r) => r.el.remove()); defectRows = [];
+  $('fName').value = '示例多卷方案';
+  rollCards.forEach((c) => c.el.remove()); rollCards = [];
   pieceRows.forEach((r) => r.el.remove()); pieceRows = [];
-  addDefectRow({ x: 1150, y: 300, w: 200, h: 250 });
+  addRollCard({ label: 'A卷', width: 1600, length: 5000, defects: [{ x: 1150, y: 300, w: 200, h: 250 }] });
+  addRollCard({ label: 'B卷', width: 1500, length: 4000, defects: [] });
   addPieceCard({ name: '前片', verts: '0,0\n620,0\n620,950\n0,950', qty: 2, rot: true });
-  addPieceCard({ name: '袖片', verts: '0,0\n360,0\n360,560\n180,460\n0,560', qty: 2, rot: true });
+  addPieceCard({ name: '袖片', verts: '0,0\n360,0\n360,560\n180,460\n0,560', qty: 2, rot: true, requiredRoll: 2 });
   addPieceCard({ name: '领片', verts: '0,0\n320,0\n160,130', qty: 3, rot: false });
 };
 
 $('btnCreate').onclick = async () => {
+  if (rollCards.length === 0) {
+    showMsg('请至少登记一卷布（点「＋添加卷」）。', true);
+    return;
+  }
   let pieces;
   try {
     pieces = pieceRows.map((r, i) => ({
@@ -564,6 +733,7 @@ $('btnCreate').onclick = async () => {
       vertices: parseVertices(r.ta.value),
       quantity: Number(r.qty.value),
       allowRotate: r.rot.checked,
+      requiredRoll: r.reqSel.value === '' ? undefined : Number(r.reqSel.value),
     }));
   } catch (err) {
     showMsg('裁片顶点解析失败：' + err.message, true);
@@ -571,21 +741,25 @@ $('btnCreate').onclick = async () => {
   }
   const body = {
     name: $('fName').value.trim(),
-    fabricWidth: Number($('fWidth').value),
-    fabricLength: Number($('fLength').value),
-    defects: defectRows.map((r) => ({
-      x: Number(r.inputs[0].value), y: Number(r.inputs[1].value),
-      w: Number(r.inputs[2].value), h: Number(r.inputs[3].value),
+    rolls: rollCards.map((c, i) => ({
+      label: c.labelInput.value.trim() || `卷${i + 1}`,
+      width: Number(c.wInput.value),
+      length: Number(c.lInput.value),
+      defects: c.defectRows.map((r) => ({
+        x: Number(r.inputs[0].value), y: Number(r.inputs[1].value),
+        w: Number(r.inputs[2].value), h: Number(r.inputs[3].value),
+      })),
     })),
     pieces,
   };
   try {
     state = await api('POST', '/api/jobs', body);
     selectedId = null;
+    currentRollId = state.rolls[0].id;
     await refreshJobList(state.job.id);
     fitScale();
     renderAll();
-    showMsg(`方案 #${state.job.id} 创建成功，请点击「优化排样」。`, false);
+    showMsg(`方案 #${state.job.id} 创建成功（${state.rolls.length} 卷），请点击「优化排样」。`, false);
   } catch (err) {
     showApiError(err, '创建失败');
   }
@@ -594,7 +768,7 @@ $('btnCreate').onclick = async () => {
 /* ================= 启动 ================= */
 
 (async function init() {
-  addDefectRow();
+  addRollCard();
   addPieceCard();
   await refreshJobList();
 })();

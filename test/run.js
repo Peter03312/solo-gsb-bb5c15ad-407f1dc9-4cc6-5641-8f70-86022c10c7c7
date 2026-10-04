@@ -2,18 +2,26 @@
 
 const assert = require('assert');
 const geom = require('../src/geom');
-const { optimize } = require('../src/nest');
+const { optimize, optimizeRolls, buildMask, Grid } = require('../src/nest');
+const { validateJobInput } = require('../src/validate');
 
 let passed = 0;
+const queue = [];
 function test(name, fn) {
-  try {
-    fn();
-    passed++;
-    console.log('  ✓ ' + name);
-  } catch (e) {
-    console.error('  ✗ ' + name);
-    console.error('    ' + e.message);
-    process.exitCode = 1;
+  queue.push({ name, fn });
+}
+
+async function runAll() {
+  for (const t of queue) {
+    try {
+      await t.fn();
+      passed++;
+      console.log('  ✓ ' + t.name);
+    } catch (e) {
+      console.error('  ✗ ' + t.name);
+      console.error('    ' + (e && e.message ? e.message : e));
+      process.exitCode = 1;
+    }
   }
 }
 
@@ -237,4 +245,450 @@ test('随机多边形（含凹形/三角）压力测试（不变量）', () => {
   console.log(`    （随机测试：排入 ${result.placements.length}/24，占用长度 ${result.usedLength}mm）`);
 });
 
-console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
+// ---------------- 多卷排样：不变量校验 ----------------
+
+console.log('栅格列区间（边接触可分别删除）');
+
+test('边对边接触的两件掩码：区间不融合，删除一件后状态精确还原', () => {
+  const W = 200, L = 1000;
+  const grid = new Grid(W, L);
+  const rectMask = (w, h) => buildMask(rect(0, 0, w, h), w, h);
+  const mA = rectMask(100, 100);
+  const mB = rectMask(100, 100);
+  // A 放 (0,0)，B 放 (0,100)：在 x=0..99 列上两件边对边接触
+  grid.markMask(mA, 0, 0, 1);
+  grid.markMask(mB, 0, 100, 1);
+  // 列 0 应有两段独立区间
+  assert.deepStrictEqual(grid.colInts[0], [[0, 100], [100, 200]]);
+  assert.strictEqual(grid.hmax[0], 200);
+  // 删除 A：只应剩 B 的区间，且栅格数据一致
+  grid.markMask(mA, 0, 0, 0);
+  assert.deepStrictEqual(grid.colInts[0], [[100, 200]], '区间不应被错误融合导致残留');
+  assert.strictEqual(grid.hmax[0], 200);
+  // A 的原区域现已空，可重新放入同一位置（columnLift 应给出 y=0 可行）
+  const y = grid.columnLift(mA, 0, 0);
+  assert.strictEqual(y, 0, '删除后边接触件下方应可重新落位');
+});
+
+console.log('多卷排样优化器');
+function verifyMultiLayout({ rolls, locked, result, typesByKey }) {
+  const placed = result.placements;
+  for (const pl of placed) {
+    const rl = rolls[pl.rollIndex];
+    assert(rl, `裁片 ${pl.key} 卷下标越界`);
+    const t = typesByKey.get(pl.key);
+    const abs = geom.toAbsolute(t.verts, pl.rotation, t.w, t.h, pl.x, pl.y);
+    for (const [x, y] of abs) {
+      assert(x >= 0 && x <= rl.W && y >= 0 && y <= rl.L, `裁片 ${pl.key} 顶点 (${x},${y}) 超出卷 ${pl.rollIndex}`);
+    }
+    for (const d of rl.defects || []) {
+      assert(
+        !geom.polygonsInteriorOverlap(abs, geom.rectPoly(d.x, d.y, d.w, d.h)),
+        `裁片 ${pl.key} 与卷${pl.rollIndex}瑕疵重叠`
+      );
+    }
+  }
+  for (let i = 0; i < placed.length; i++) {
+    for (let j = i + 1; j < placed.length; j++) {
+      if (placed[i].rollIndex !== placed[j].rollIndex) continue; // 不同卷互不干涉
+      const ta = typesByKey.get(placed[i].key);
+      const tb = typesByKey.get(placed[j].key);
+      const a = geom.toAbsolute(ta.verts, placed[i].rotation, ta.w, ta.h, placed[i].x, placed[i].y);
+      const b = geom.toAbsolute(tb.verts, placed[j].rotation, tb.w, tb.h, placed[j].x, placed[j].y);
+      assert(!geom.polygonsInteriorOverlap(a, b), `同卷裁片 ${placed[i].key} 与 ${placed[j].key} 内部重叠`);
+    }
+  }
+  for (const lp of locked) {
+    const got = placed.find((p) => p.key === lp.key);
+    assert(got, '锁定件丢失');
+    assert(
+      got.rollIndex === lp.rollIndex && got.x === lp.x && got.y === lp.y && got.rotation === lp.rot,
+      `锁定件 ${lp.key} 的卷号或位置被改变`
+    );
+  }
+  // rollUsedLengths 与 usedLength 一致
+  assert.strictEqual(
+    result.usedLength,
+    result.rollUsedLengths.reduce((a, b) => a + b, 0),
+    'usedLength 应为各卷之和'
+  );
+}
+
+console.log('多卷排样优化器');
+
+test('两卷都容得下全部件时只启用一卷（省卷）', () => {
+  const pieces = [];
+  for (let i = 0; i < 4; i++) {
+    pieces.push({ key: 'p' + i, maskKey: 'r', verts: rect(0, 0, 400, 400), allowRotate: false, w: 400, h: 400, area: 160000 });
+  }
+  const result = optimizeRolls({
+    rolls: [
+      { label: 'R1', W: 1000, L: 5000, defects: [] },
+      { label: 'R2', W: 1000, L: 5000, defects: [] },
+    ],
+    locked: [],
+    pieces,
+  });
+  assert.strictEqual(result.unplaced.length, 0);
+  const opened = result.rollUsedLengths.filter((l) => l > 0).length;
+  assert.strictEqual(opened, 1, '应只启用 1 卷');
+  verifyMultiLayout({ rolls: [{ W: 1000, L: 5000 }, { W: 1000, L: 5000 }], locked: [], result, typesByKey: new Map(pieces.map((p) => [p.key, p])) });
+});
+
+test('一卷装不下时自动启用第二卷，全部排入', () => {
+  const pieces = [];
+  for (let i = 0; i < 6; i++) {
+    pieces.push({ key: 'p' + i, maskKey: 'r', verts: rect(0, 0, 450, 450), allowRotate: false, w: 450, h: 450, area: 202500 });
+  }
+  const rolls = [
+    { label: 'R1', W: 1000, L: 1000, defects: [] }, // 每卷最多 4 件
+    { label: 'R2', W: 1000, L: 1000, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked: [], pieces });
+  assert.strictEqual(result.unplaced.length, 0, '6 件应全部排入两卷');
+  assert.strictEqual(result.rollUsedLengths.filter((l) => l > 0).length, 2, '两卷都应启用');
+  verifyMultiLayout({ rolls, locked: [], result, typesByKey: new Map(pieces.map((p) => [p.key, p])) });
+});
+
+test('必用卷约束：必用件只在指定卷；省卷优先时其余件向已开卷集中', () => {
+  // 1 件必用卷2；3 件普通件。1000 宽卷每行 2 件 400，卷2 长度 5000 足够全部放入
+  // → 最少启用卷数为 1 时不可行（必用件强制开卷2，普通件全部去卷2仍只需1卷）→
+  // 实际：必用件开卷2，普通件若全去卷2则总只开 1 卷（卷2），这是省卷最优，允许。
+  const pieces = [
+    { key: 'a', maskKey: 'r', verts: rect(0, 0, 400, 400), allowRotate: false, w: 400, h: 400, area: 160000, requiredIndex: 1 },
+    { key: 'b', maskKey: 'r', verts: rect(0, 0, 400, 400), allowRotate: false, w: 400, h: 400, area: 160000 },
+  ];
+  const rolls = [
+    { label: 'R1', W: 1000, L: 5000, defects: [] },
+    { label: 'R2', W: 1000, L: 5000, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked: [], pieces });
+  const pa = result.placements.find((p) => p.key === 'a');
+  assert.strictEqual(pa.rollIndex, 1, '必用卷件必须在卷2');
+  assert.strictEqual(result.rollUsedLengths.filter((l) => l > 0).length, 1, '最少卷数=1（卷2）');
+  verifyMultiLayout({ rolls, locked: [], result, typesByKey: new Map(pieces.map((p) => [p.key, p])) });
+});
+
+test('必用卷约束 + 容量：必用卷装不下全部时才开第二卷，且必用件绝不去别的卷', () => {
+  // 卷2很短（只能放 1 行 2 件 400），必用件 a 在卷2；再放 3 件普通件
+  const pieces = [
+    { key: 'a', maskKey: 'r', verts: rect(0, 0, 400, 400), allowRotate: false, w: 400, h: 400, area: 160000, requiredIndex: 1 },
+    ...[0, 1, 2].map((i) => ({ key: 'b' + i, maskKey: 'r', verts: rect(0, 0, 400, 400), allowRotate: false, w: 400, h: 400, area: 160000 })),
+  ];
+  const rolls = [
+    { label: 'R1', W: 1000, L: 5000, defects: [] },
+    { label: 'R2', W: 1000, L: 500, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked: [], pieces });
+  assert.strictEqual(result.unplaced.length, 0, result.unplaced.map((u) => u.reason).join('；'));
+  assert.strictEqual(result.placements.find((p) => p.key === 'a').rollIndex, 1);
+  assert.strictEqual(result.rollUsedLengths.filter((l) => l > 0).length, 2, '容量迫使开第二卷');
+  verifyMultiLayout({ rolls, locked: [], result, typesByKey: new Map(pieces.map((p) => [p.key, p])) });
+});
+
+test('必用卷长度不足：该件未排，其余件照常排入（部分方案，不牺牲可排件）', () => {
+  const pieces = [
+    { key: 'big', maskKey: 'r', verts: rect(0, 0, 400, 800), allowRotate: false, w: 400, h: 800, area: 320000, requiredIndex: 0 },
+    { key: 'ok', maskKey: 'r2', verts: rect(0, 0, 200, 200), allowRotate: false, w: 200, h: 200, area: 40000 },
+  ];
+  const rolls = [
+    { label: '短卷', W: 1000, L: 500, defects: [] },
+    { label: '长卷', W: 1000, L: 5000, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked: [], pieces });
+  assert.strictEqual(result.placements.length, 1, '只排入 1 件');
+  assert.strictEqual(result.unplaced.length, 1);
+  assert.strictEqual(result.unplaced[0].key, 'big');
+  assert(/必用卷/.test(result.unplaced[0].reason), '原因应指明必用卷');
+});
+
+test('各卷瑕疵独立：卷1瑕疵不影响卷2排样', () => {
+  const pieces = [{ key: 'a', maskKey: 'r', verts: rect(0, 0, 200, 200), allowRotate: false, w: 200, h: 200, area: 40000, requiredIndex: 1 }];
+  const rolls = [
+    { label: 'R1', W: 1000, L: 1000, defects: [{ x: 0, y: 0, w: 1000, h: 1000 }] }, // 卷1全瑕疵
+    { label: 'R2', W: 1000, L: 1000, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked: [], pieces });
+  assert.strictEqual(result.unplaced.length, 0, '卷2干净，应排入');
+  assert.strictEqual(result.placements[0].rollIndex, 1);
+  verifyMultiLayout({ rolls, locked: [], result, typesByKey: new Map(pieces.map((p) => [p.key, p])) });
+});
+
+test('跨卷压实可腾空整卷', () => {
+  // 锁定：卷1放一件占着卷1；解锁件都很小。再给一件必用卷1以外的件→
+  // 这里直接构造：锁定件在卷1，4 个 450x450 件可被重排。1000 宽卷每排2件。
+  const pieces = [];
+  for (let i = 0; i < 4; i++) {
+    pieces.push({ key: 'p' + i, maskKey: 'r', verts: rect(0, 0, 450, 450), allowRotate: false, w: 450, h: 450, area: 202500 });
+  }
+  const locked = [{ key: 'L1', rollIndex: 0, verts: rect(0, 0, 100, 100), rot: 0, x: 0, y: 0, w: 100, h: 100 }];
+  const rolls = [
+    { label: 'R1', W: 1000, L: 2000, defects: [] },
+    { label: 'R2', W: 1000, L: 2000, defects: [] },
+  ];
+  // L1 在卷1 → 卷1必然启用；4 件 450x450 与 100x100 锁定件同卷可容纳（首行仍可放2件450）
+  const result = optimizeRolls({ rolls, locked, pieces });
+  assert.strictEqual(result.unplaced.length, 0);
+  // 卷1已被锁定件启用，最优是 4 件全放卷1，卷2不启用
+  assert.strictEqual(result.rollUsedLengths[1], 0, '卷2应可被腾空');
+  const typesByKey = new Map(pieces.map((p) => [p.key, p]));
+  typesByKey.set('L1', { verts: rect(0, 0, 100, 100), w: 100, h: 100 });
+  verifyMultiLayout({ rolls, locked, result, typesByKey });
+});
+
+test('空卷宽度不同：宽件能排入更宽的空卷（不因按代表卷漏排）', () => {
+  // 卷1窄（放不下 1200 宽件），卷2宽且空无瑕疵；空卷代表不能只取卷1
+  const pieces = [
+    { key: 'wide', maskKey: 'r', verts: rect(0, 0, 1200, 300), allowRotate: false, w: 1200, h: 300, area: 360000 },
+    { key: 'small', maskKey: 'r2', verts: rect(0, 0, 100, 100), allowRotate: false, w: 100, h: 100, area: 10000 },
+  ];
+  const rolls = [
+    { label: '窄', W: 900, L: 3000, defects: [] },
+    { label: '宽', W: 1600, L: 3000, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked: [], pieces });
+  assert.strictEqual(result.unplaced.length, 0, '两件都应排入（宽件去宽卷）');
+  const w = result.placements.find((p) => p.key === 'wide');
+  assert.strictEqual(w.rollIndex, 1, '宽件应在宽卷');
+  verifyMultiLayout({ rolls, locked: [], result, typesByKey: new Map(pieces.map((p) => [p.key, p])) });
+});
+
+test('多卷锁定件：跨卷位置与卷号都保持固定', () => {
+  const locked = [
+    { key: 'L1', rollIndex: 0, verts: rect(0, 0, 300, 300), rot: 0, x: 0, y: 0, w: 300, h: 300 },
+    { key: 'L2', rollIndex: 1, verts: rect(0, 0, 300, 300), rot: 0, x: 700, y: 700, w: 300, h: 300 },
+  ];
+  const pieces = [{ key: 'p', maskKey: 'r', verts: rect(0, 0, 200, 200), allowRotate: false, w: 200, h: 200, area: 40000 }];
+  const rolls = [
+    { label: 'R1', W: 1000, L: 2000, defects: [] },
+    { label: 'R2', W: 1000, L: 2000, defects: [] },
+  ];
+  const result = optimizeRolls({ rolls, locked, pieces });
+  verifyMultiLayout({ rolls, locked, result, typesByKey: new Map([...pieces.map((p) => [p.key, p]), ...locked.map((l) => [l.key, { verts: l.verts, w: l.w, h: l.h }])]) });
+  const l1 = result.placements.find((p) => p.key === 'L1');
+  const l2 = result.placements.find((p) => p.key === 'L2');
+  assert(l1.rollIndex === 0 && l1.x === 0 && l1.y === 0);
+  assert(l2.rollIndex === 1 && l2.x === 700 && l2.y === 700);
+});
+
+// ---------------- 创建输入校验：多卷与必用卷 ----------------
+
+console.log('多卷输入校验');
+
+test('多卷形式通过：rolls + 按序号/卷号指定必用卷', () => {
+  const r1 = validateJobInput({
+    rolls: [
+      { label: 'A', width: 1000, length: 2000, defects: [] },
+      { label: 'B', width: 1200, length: 3000 },
+    ],
+    pieces: [
+      { name: 'p1', vertices: [[0, 0], [10, 0], [10, 10], [0, 10]], quantity: 1, requiredRoll: 2 },
+      { name: 'p2', vertices: [[0, 0], [10, 0], [10, 10], [0, 10]], quantity: 1, requiredRoll: 'B' },
+    ],
+  });
+  assert.strictEqual(r1.errors.length, 0, r1.errors.join('；'));
+  assert.strictEqual(r1.value.pieces[0].requiredRollIndex, 1);
+  assert.strictEqual(r1.value.pieces[1].requiredRollIndex, 1);
+});
+
+test('旧单卷形式继续通过并归一为一卷', () => {
+  const r = validateJobInput({
+    fabricWidth: 1500, fabricLength: 5000,
+    defects: [{ x: 0, y: 0, w: 10, h: 10 }],
+    pieces: [{ name: 'q', vertices: [[0, 0], [100, 0], [100, 100], [0, 100]], quantity: 2 }],
+  });
+  assert.strictEqual(r.errors.length, 0, r.errors.join('；'));
+  assert.strictEqual(r.value.rolls.length, 1);
+  assert.strictEqual(r.value.rolls[0].width, 1500);
+  assert.strictEqual(r.value.rolls[0].defects.length, 1);
+});
+
+test('必用卷序号越界被拒绝', () => {
+  const r = validateJobInput({
+    rolls: [{ width: 1000, length: 1000 }],
+    pieces: [{ name: 'p', vertices: [[0, 0], [10, 0], [10, 10], [0, 10]], quantity: 1, requiredRoll: 3 }],
+  });
+  assert(r.errors.some((e) => /必用卷序号 3 无效/.test(e)));
+});
+
+test('不存在的卷号文本被拒绝并列出已登记卷号', () => {
+  const r = validateJobInput({
+    rolls: [{ label: '甲', width: 1000, length: 1000 }],
+    pieces: [{ name: 'p', vertices: [[0, 0], [10, 0], [10, 10], [0, 10]], quantity: 1, requiredRoll: '乙' }],
+  });
+  assert(r.errors.some((e) => /卷号「乙」不存在/.test(e) && /甲/.test(e)));
+});
+
+test('宽度超过必用卷被拒绝（即便其他卷容得下）', () => {
+  const r = validateJobInput({
+    rolls: [{ label: '窄', width: 100, length: 1000 }, { label: '宽', width: 1000, length: 1000 }],
+    pieces: [{ name: 'p', vertices: [[0, 0], [500, 0], [500, 500], [0, 500]], quantity: 1, requiredRoll: 1 }],
+  });
+  assert(r.errors.some((e) => /超过必用卷「窄」布幅/.test(e)), r.errors.join('；'));
+});
+
+test('重复卷号被拒绝', () => {
+  const r = validateJobInput({
+    rolls: [{ label: 'R', width: 1000, length: 1000 }, { label: 'R', width: 1000, length: 1000 }],
+    pieces: [{ name: 'p', vertices: [[0, 0], [10, 0], [10, 10], [0, 10]], quantity: 1 }],
+  });
+  assert(r.errors.some((e) => /卷号「R」重复/.test(e)));
+});
+
+test('瑕疵超出所属卷范围被拒绝', () => {
+  const r = validateJobInput({
+    rolls: [{ label: 'R', width: 500, length: 500, defects: [{ x: 400, y: 0, w: 200, h: 10 }] }],
+    pieces: [{ name: 'p', vertices: [[0, 0], [10, 0], [10, 10], [0, 10]], quantity: 1 }],
+  });
+  assert(r.errors.some((e) => /超出该卷范围/.test(e)));
+});
+
+test('多卷中某卷容得下即可（不因首卷窄而误拒）', () => {
+  const r = validateJobInput({
+    rolls: [{ label: '窄', width: 100, length: 1000 }, { label: '宽', width: 1000, length: 1000 }],
+    pieces: [{ name: 'p', vertices: [[0, 0], [500, 0], [500, 500], [0, 500]], quantity: 1 }],
+  });
+  assert.strictEqual(r.errors.length, 0, r.errors.join('；'));
+});
+
+// ---------------- HTTP API（多卷端到端） ----------------
+
+console.log('HTTP API（多卷）');
+
+async function withServer(fn) {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const http = require('http');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nesting-test-'));
+  process.env.DATA_DIR = dir;
+  process.env.PORT = '0';
+  const app = require('../src/server');
+  const server = app.listen(0);
+  await new Promise((res) => server.once('listening', res));
+  const port = server.address().port;
+  const call = (method, urlPath, body) =>
+    new Promise((resolve) => {
+      const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+      const req = http.request(
+        { port, host: '127.0.0.1', method, path: urlPath, headers: payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {} },
+        (res) => {
+          let data = '';
+          res.on('data', (c) => (data += c));
+          res.on('end', () => resolve({ status: res.statusCode, data: data ? JSON.parse(data) : null }));
+        }
+      );
+      if (payload) req.write(payload);
+      req.end();
+    });
+  try {
+    await fn(call);
+  } finally {
+    await new Promise((res) => server.close(res));
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete require.cache[require.resolve('../src/server')];
+    delete require.cache[require.resolve('../src/db')];
+  }
+}
+
+test('API：多卷创建→优化→锁定重优化→旧字段兼容', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      name: 'api多卷',
+      rolls: [
+        { label: 'A卷', width: 1000, length: 2000, defects: [{ x: 0, y: 0, w: 300, h: 300 }] },
+        { label: 'B卷', width: 1200, length: 3000 },
+      ],
+      pieces: [
+        { name: '大片', vertices: [[0, 0], [500, 0], [500, 800], [0, 800]], quantity: 2, allowRotate: true },
+        { name: '袖片', vertices: [[0, 0], [300, 0], [300, 400], [0, 400]], quantity: 1, requiredRoll: 2 },
+      ],
+    });
+    assert.strictEqual(cr.status, 201, JSON.stringify(cr.data));
+    const jobId = cr.data.job.id;
+    assert.strictEqual(cr.data.job.rollCount, 2);
+    assert(Array.isArray(cr.data.rolls) && cr.data.rolls.length === 2);
+    const A = cr.data.rolls[0].id;
+    const B = cr.data.rolls[1].id;
+
+    // 列表接口带 rollCount
+    const list = await call('GET', '/api/jobs');
+    const row = list.data.find((j) => j.id === jobId);
+    assert.strictEqual(row.rollCount, 2);
+    assert.strictEqual(row.fabricWidth, 1000); // 旧字段=首卷宽度
+
+    // 优化
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.status, 200);
+    assert.strictEqual(op.data.unplaced.length, 0);
+    assert(op.data.placements.every((p) => typeof p.rollId === 'number'), '每件都带 rollId');
+    const xiu = op.data.placements.find((p) => p.name === '袖片');
+    assert.strictEqual(xiu.rollId, B, '袖片必用B卷');
+
+    // 锁定大片#1 在其当前位置，重优化后位置/卷不变
+    const dp = op.data.placements.find((p) => p.name === '大片' && p.seq === 1);
+    const lk = await call('POST', `/api/jobs/${jobId}/placements/${dp.id}/lock`, { locked: true });
+    assert.strictEqual(lk.status, 200);
+    const op2 = await call('POST', `/api/jobs/${jobId}/optimize`);
+    const dp2 = op2.data.placements.find((p) => p.id === dp.id);
+    assert(dp2.locked && dp2.rollId === dp.rollId && dp2.x === dp.x && dp2.y === dp.y, '锁定件不动');
+
+    // 锁定件移动 409
+    const lm = await call('POST', `/api/jobs/${jobId}/placements/${dp.id}/move`, { rollId: dp.rollId, x: 5, y: 5, rotation: 0 });
+    assert.strictEqual(lm.status, 409);
+
+    // 必用卷跨卷移动 409 且指出对象
+    const mv = await call('POST', `/api/jobs/${jobId}/placements/${xiu.id}/move`, { rollId: A, x: 0, y: 0, rotation: 0 });
+    assert.strictEqual(mv.status, 409);
+    assert(/必用卷/.test(mv.data.error) && mv.data.conflicts.length >= 1);
+
+    // 无效目标卷 400
+    const bad = await call('POST', `/api/jobs/${jobId}/placements/${xiu.id}/move`, { rollId: 99999, x: 0, y: 0, rotation: 0 });
+    assert.strictEqual(bad.status, 400);
+
+    // require-roll：改必用卷为 A（500<=1000 合法）
+    const rr = await call('POST', `/api/jobs/${jobId}/placements/${xiu.id}/require-roll`, { rollId: A });
+    assert.strictEqual(rr.status, 200);
+    assert.strictEqual(rr.data.placements.find((p) => p.id === xiu.id).requiredRollId, A);
+    // 必用卷太窄 400（用一个新宽件场景：袖片 300 宽，这里构造窄卷 via 新方案）
+  })
+);
+
+test('API：必用卷放不下时优化为部分方案，未排件带原因且响应保留卷字段', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: '短卷', width: 500, length: 500 }],
+      pieces: [{ name: '块', vertices: [[0, 0], [500, 0], [500, 400], [0, 400]], quantity: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.data.job.status, 'partial');
+    assert.strictEqual(op.data.unplaced.length, 1);
+    assert(op.data.unplaced[0].reason && op.data.unplaced[0].reason.length > 0);
+    assert(Array.isArray(op.data.rolls));
+  })
+);
+
+test('API：旧单卷数据与旧调用方式兼容（无 rolls、move 不带 rollId）', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      name: '旧', fabricWidth: 1500, fabricLength: 5000,
+      defects: [{ x: 1, y: 2, w: 10, h: 10 }],
+      pieces: [{ name: 'q', vertices: [[0, 0], [100, 0], [100, 100], [0, 100]], quantity: 2 }],
+    });
+    assert.strictEqual(cr.status, 201, JSON.stringify(cr.data));
+    assert.strictEqual(cr.data.rolls[0].label, '默认卷');
+    assert.strictEqual(cr.data.defects.length, 1, '旧 defects 字段仍返回首卷瑕疵');
+    const jobId = cr.data.job.id;
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.data.unplaced.length, 0);
+    const pid = op.data.placements[0].id;
+    const mv = await call('POST', `/api/jobs/${jobId}/placements/${pid}/move`, { x: 200, y: 200, rotation: 0 });
+    assert.strictEqual(mv.status, 200, JSON.stringify(mv.data));
+    assert.strictEqual(mv.data.placements.find((p) => p.id === pid).x, 200);
+  })
+);
+
+runAll().then(() => {
+  console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
+});
