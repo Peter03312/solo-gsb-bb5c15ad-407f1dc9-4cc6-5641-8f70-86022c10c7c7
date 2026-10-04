@@ -362,4 +362,114 @@ function optimize({ W, L, defects, locked, pieces }) {
   };
 }
 
-module.exports = { optimize, buildMask, Grid };
+/**
+ * 多卷排样。
+ *
+ * 目标（字典序）：排入件数最多 → 启用卷数最少 → 总占用长度最小。
+ * 绝不为减少用卷而把本可排入的裁片留到未排区。
+ *
+ * 策略：按卷号顺序逐卷填充——每卷先排该卷的必用卷裁片，再尽量排入剩余自由裁片；
+ * 自由裁片在当前卷放不下时顺延到下一卷（启用卷始终保持为前缀，卷数因此最小化）；
+ * 所有卷都放不下的自由裁片、以及必用卷上放不下的裁片进入未排区。
+ * 锁定裁片与各卷瑕疵区作为固定障碍，全程不动。
+ *
+ * @param {object} input
+ *   rolls   [{key, label, W, L, defects: [{x,y,w,h}], locked: [{key, verts, rot, x, y, w, h}]}]
+ *           按使用顺序（卷号升序）给出；label 仅用于未排原因描述
+ *   pieces  [{key, maskKey, verts, allowRotate, w, h, area, requiredRoll: rollKey|null}]
+ * @returns { placements: [{key, roll, x, y, rotation, h}],   -- 含锁定件（roll 为卷 key）
+ *            unplaced: [{key, reason}],
+ *            usedLength,                                      -- 各启用卷占用长度之和
+ *            rollsUsed,                                       -- 启用卷数
+ *            rollUsedLength: Map<rollKey, number> }
+ */
+function optimizeMulti({ rolls, pieces }) {
+  const rollByKey = new Map(rolls.map((r) => [r.key, r]));
+  const required = new Map(); // rollKey -> [piece]
+  const free = [];
+  const unplaced = [];
+
+  for (const p of pieces) {
+    if (p.requiredRoll != null) {
+      if (!rollByKey.has(p.requiredRoll)) {
+        unplaced.push({ key: p.key, reason: `指定的必用卷不存在（卷号 ${p.requiredRoll}）` });
+        continue;
+      }
+      const arr = required.get(p.requiredRoll);
+      if (arr) arr.push(p);
+      else required.set(p.requiredRoll, [p]);
+    } else {
+      free.push(p);
+    }
+  }
+
+  const placements = [];
+  let remaining = free;
+
+  for (const roll of rolls) {
+    const label = roll.label != null ? `卷${roll.label}` : `卷${roll.key}`;
+    const must = required.get(roll.key) || [];
+
+    // 锁定件：原样记录（固定障碍，不参与重排）
+    for (const l of roll.locked) {
+      placements.push({ key: l.key, roll: roll.key, x: l.x, y: l.y, rotation: l.rot, h: l.h });
+    }
+    const lockedKeys = new Set(roll.locked.map((l) => l.key));
+
+    // 第一遍：必用卷件优先落位（不被自由件挤占）
+    let obstacles = roll.locked;
+    if (must.length > 0) {
+      const mustResult = optimize({ W: roll.W, L: roll.L, defects: roll.defects, locked: roll.locked, pieces: must });
+      const mustByKey = new Map(must.map((p) => [p.key, p]));
+      const placedAsObstacles = [];
+      for (const pl of mustResult.placements) {
+        if (lockedKeys.has(pl.key)) continue;
+        placements.push({ key: pl.key, roll: roll.key, x: pl.x, y: pl.y, rotation: pl.rotation, h: pl.h });
+        const p = mustByKey.get(pl.key);
+        placedAsObstacles.push({ key: pl.key, verts: p.verts, rot: pl.rotation, x: pl.x, y: pl.y, w: p.w, h: p.h });
+      }
+      obstacles = [...roll.locked, ...placedAsObstacles];
+      for (const u of mustResult.unplaced) {
+        unplaced.push({ key: u.key, reason: `必用${label}内：${u.reason}` });
+      }
+    }
+
+    // 第二遍：自由件绕开锁定件与已落位的必用卷件填充，放不下的顺延到下一卷
+    if (remaining.length > 0) {
+      const freeResult = optimize({ W: roll.W, L: roll.L, defects: roll.defects, locked: obstacles, pieces: remaining });
+      const obstacleKeys = new Set(obstacles.map((o) => o.key));
+      for (const pl of freeResult.placements) {
+        if (obstacleKeys.has(pl.key)) continue; // 障碍件已记录过
+        placements.push({ key: pl.key, roll: roll.key, x: pl.x, y: pl.y, rotation: pl.rotation, h: pl.h });
+      }
+      const overflow = new Set(freeResult.unplaced.map((u) => u.key));
+      remaining = remaining.filter((p) => overflow.has(p.key));
+    }
+  }
+
+  // 全部卷都放不下的自由裁片 → 未排区
+  const maxW = rolls.length > 0 ? Math.max(...rolls.map((r) => r.W)) : 0;
+  for (const p of remaining) {
+    unplaced.push({
+      key: p.key,
+      reason:
+        p.w > maxW
+          ? `裁片外接宽度 ${p.w}mm 超出所有卷的宽度（最大 ${maxW}mm）`
+          : '各卷可用空间内均找不到可行位置',
+    });
+  }
+
+  // 统计：逐卷占用长度（含锁定件），启用卷数与总占用长度
+  const rollUsedLength = new Map();
+  for (const pl of placements) {
+    const top = pl.y + pl.h;
+    const cur = rollUsedLength.get(pl.roll) || 0;
+    if (top > cur) rollUsedLength.set(pl.roll, top);
+  }
+  let usedLength = 0;
+  for (const v of rollUsedLength.values()) usedLength += v;
+
+  return { placements, unplaced, usedLength, rollsUsed: rollUsedLength.size, rollUsedLength };
+}
+
+module.exports = { optimize, optimizeMulti, buildMask, Grid };

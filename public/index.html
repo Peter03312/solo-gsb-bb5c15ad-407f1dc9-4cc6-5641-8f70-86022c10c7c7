@@ -24,17 +24,9 @@
           <label>名称</label>
           <input id="fName" type="text" placeholder="例如：秋季夹克 M 码">
         </div>
-        <div class="row">
-          <label>布幅宽度 (mm)</label>
-          <input id="fWidth" type="number" min="1" step="1" value="1600">
-        </div>
-        <div class="row">
-          <label>可用长度 (mm)</label>
-          <input id="fLength" type="number" min="1" step="1" value="5000">
-        </div>
 
-        <h3>瑕疵区（矩形，整数 mm）<button id="btnAddDefect" class="mini">＋添加</button></h3>
-        <div id="defectList"></div>
+        <h3>布卷（卷号按顺序 1..n）<button id="btnAddRoll" class="mini">＋添加卷</button></h3>
+        <div id="rollList"></div>
 
         <h3>裁片型号 <button id="btnAddPiece" class="mini">＋添加</button></h3>
         <div id="pieceList"></div>
@@ -49,6 +41,10 @@
         <h2>选中裁片</h2>
         <div id="selInfo"></div>
         <div class="row">
+          <label>目标卷</label>
+          <select id="selRoll"></select>
+        </div>
+        <div class="row">
           <label>x (mm)</label><input id="selX" type="number" step="1">
         </div>
         <div class="row">
@@ -62,13 +58,18 @@
           </select>
         </div>
         <div class="row">
-          <label><input id="selLocked" type="checkbox"> 锁定（优化时固定）</label>
+          <label>必用卷</label>
+          <select id="selRequired"></select>
+          <button id="btnSetRequired" class="mini">设置</button>
+        </div>
+        <div class="row">
+          <label><input id="selLocked" type="checkbox"> 锁定（优化时固定卷号与位置）</label>
         </div>
         <div class="row btns">
           <button id="btnApplyMove" class="primary">应用位置</button>
           <button id="btnUnplace">移回未排区</button>
         </div>
-        <p class="hint">提示：也可直接在画布上拖动裁片（锁定件需先解锁）。</p>
+        <p class="hint">提示：也可直接在画布上拖动裁片（锁定件需先解锁）；跨卷移动请在上方选择目标卷后应用。</p>
       </section>
     </aside>
 
@@ -81,6 +82,7 @@
         <button id="btnZoomOut">－</button>
         <button id="btnZoomIn">＋</button>
       </div>
+      <div id="rollTabs"></div>
       <div id="msg"></div>
       <div id="unplacedPanel"></div>
       <div id="canvasWrap"><canvas id="cv"></canvas></div>

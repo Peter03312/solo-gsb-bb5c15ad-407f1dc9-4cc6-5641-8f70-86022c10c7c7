@@ -2,7 +2,8 @@
 
 const assert = require('assert');
 const geom = require('../src/geom');
-const { optimize } = require('../src/nest');
+const { optimize, optimizeMulti } = require('../src/nest');
+const { validateJobInput } = require('../src/validate');
 
 let passed = 0;
 function test(name, fn) {
@@ -235,6 +236,286 @@ test('随机多边形（含凹形/三角）压力测试（不变量）', () => {
   const typesByKey = new Map(pieces.map((p) => [p.key, p]));
   verifyLayout({ W, L, defects: [], locked: [], result, typesByKey });
   console.log(`    （随机测试：排入 ${result.placements.length}/24，占用长度 ${result.usedLength}mm）`);
+});
+
+// ---------------- 多卷排样 ----------------
+console.log('多卷排样');
+
+/** 多卷结果不变量校验：各卷边界、两两不重叠、不压本卷瑕疵、锁定件不动、必用卷约束 */
+function verifyMulti({ rolls, pieces, result }) {
+  const rollByKey = new Map(rolls.map((r) => [r.key, r]));
+  const pieceByKey = new Map(pieces.map((p) => [p.key, p]));
+  const lockedByKey = new Map();
+  for (const r of rolls) for (const l of r.locked) lockedByKey.set(l.key, { roll: r, l });
+  const polys = result.placements.map((pl) => {
+    const roll = rollByKey.get(pl.roll);
+    assert(roll, `裁片 ${pl.key} 落在不存在的卷 ${pl.roll}`);
+    const src = pieceByKey.get(pl.key) || lockedByKey.get(pl.key).l;
+    const verts = src.verts;
+    const w = src.w;
+    const h = src.h;
+    const abs = geom.toAbsolute(verts, pl.rotation, w, h, pl.x, pl.y);
+    return { pl, roll, abs };
+  });
+  for (const { pl, roll, abs } of polys) {
+    for (const [x, y] of abs) {
+      assert(x >= 0 && x <= roll.W && y >= 0 && y <= roll.L, `裁片 ${pl.key} 顶点 (${x},${y}) 超出卷${pl.roll}`);
+    }
+    for (const d of roll.defects) {
+      assert(
+        !geom.polygonsInteriorOverlap(abs, geom.rectPoly(d.x, d.y, d.w, d.h)),
+        `裁片 ${pl.key} 与卷${pl.roll}瑕疵区重叠`
+      );
+    }
+  }
+  for (let i = 0; i < polys.length; i++) {
+    for (let j = i + 1; j < polys.length; j++) {
+      if (polys[i].roll !== polys[j].roll) continue; // 不同卷天然不重叠
+      assert(
+        !geom.polygonsInteriorOverlap(polys[i].abs, polys[j].abs),
+        `裁片 ${polys[i].pl.key} 与 ${polys[j].pl.key} 在卷${polys[i].pl.roll} 内部重叠`
+      );
+    }
+  }
+  // 锁定件不动
+  for (const [key, { roll, l }] of lockedByKey) {
+    const got = result.placements.find((p) => p.key === key);
+    assert(got, `锁定件 ${key} 丢失`);
+    assert(got.roll === roll.key && got.x === l.x && got.y === l.y && got.rotation === l.rot, `锁定件 ${key} 被移动`);
+  }
+  // 必用卷约束
+  for (const p of pieces) {
+    if (p.requiredRoll == null) continue;
+    const got = result.placements.find((x) => x.key === p.key);
+    if (got) assert(got.roll === p.requiredRoll, `裁片 ${p.key} 未落在必用卷 ${p.requiredRoll}`);
+  }
+  return polys;
+}
+
+const mkRect = (key, w, h, extra) =>
+  Object.assign({ key, maskKey: 'm' + key, verts: rect(0, 0, w, h), allowRotate: false, w, h, area: w * h, requiredRoll: null }, extra);
+
+test('多卷：自由件按卷序填充，启用卷为前缀', () => {
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 1000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1000, L: 1000, defects: [], locked: [] },
+    { key: 'R3', label: 3, W: 1000, L: 1000, defects: [], locked: [] },
+  ];
+  // 卷 1 恰好放 4 件 500×500，第 5 件应启用卷 2，卷 3 不启用
+  const pieces = [];
+  for (let i = 0; i < 5; i++) pieces.push(mkRect('p' + i, 500, 500));
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 0, '应全部排入');
+  assert.strictEqual(result.rollsUsed, 2, `应启用 2 卷，实际 ${result.rollsUsed}`);
+  const rollsUsed = new Set(result.placements.map((p) => p.roll));
+  assert(rollsUsed.has('R1') && rollsUsed.has('R2') && !rollsUsed.has('R3'), '启用卷应为前缀 R1,R2');
+  assert.strictEqual(result.usedLength, 1000 + 500, '总占用长度应为各卷之和');
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：全部装得下时不启用后续卷', () => {
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 2000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1000, L: 2000, defects: [], locked: [] },
+  ];
+  const pieces = [mkRect('a', 500, 500), mkRect('b', 500, 500)];
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 0);
+  assert.strictEqual(result.rollsUsed, 1, '小批量不应启用第二卷');
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：必用卷约束生效，且必用卷放不下的进未排区', () => {
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 1000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1000, L: 1000, defects: [{ x: 0, y: 0, w: 1000, h: 900 }], locked: [] },
+  ];
+  const pieces = [
+    mkRect('must2', 500, 500, { requiredRoll: 'R2' }),   // 必用卷2，卷2仅剩 1000×100 空间 → 放不下
+    mkRect('free1', 500, 500),
+    mkRect('free2', 500, 500),
+  ];
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 1, '必用卷放不下的件应进未排区');
+  assert.strictEqual(result.unplaced[0].key, 'must2');
+  assert(/必用卷/.test(result.unplaced[0].reason), '未排原因应指明必用卷');
+  assert.strictEqual(result.placements.length, 2, '自由件不受影响');
+  assert(result.placements.every((p) => p.roll === 'R1'), '自由件应排在卷1');
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：宽件只容得下宽卷', () => {
+  const rolls = [
+    { key: 'R1', label: 1, W: 600, L: 2000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1200, L: 2000, defects: [], locked: [] },
+  ];
+  const pieces = [mkRect('wide', 900, 400), mkRect('narrow', 300, 300)];
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 0);
+  const wide = result.placements.find((p) => p.key === 'wide');
+  assert.strictEqual(wide.roll, 'R2', '宽件应落到宽卷');
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：所有卷都容不下的超宽件进未排区并说明原因', () => {
+  const rolls = [
+    { key: 'R1', label: 1, W: 600, L: 2000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 800, L: 2000, defects: [], locked: [] },
+  ];
+  const pieces = [mkRect('huge', 900, 100)];
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 1);
+  assert(/超出所有卷/.test(result.unplaced[0].reason));
+  assert.strictEqual(result.rollsUsed, 0);
+});
+
+test('多卷：锁定件跨卷保持固定，其余绕开', () => {
+  const lockedVerts = rect(0, 0, 500, 500);
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 1000, defects: [], locked: [] },
+    {
+      key: 'R2', label: 2, W: 1000, L: 2000, defects: [{ x: 600, y: 0, w: 200, h: 200 }],
+      locked: [{ key: 'L1', verts: lockedVerts, rot: 0, x: 100, y: 300, w: 500, h: 500 }],
+    },
+  ];
+  const pieces = [mkRect('a', 500, 500), mkRect('b', 500, 500), mkRect('c', 400, 400)];
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 0);
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：绝不为减少用卷牺牲可排入的件', () => {
+  // 两卷各 1000×1000，5 件 500×500：必须启用 2 卷才能排入全部
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 1000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1000, L: 1000, defects: [], locked: [] },
+  ];
+  const pieces = [];
+  for (let i = 0; i < 5; i++) pieces.push(mkRect('p' + i, 500, 500));
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 0, '件数优先：不得为少用卷而留件未排');
+  assert.strictEqual(result.rollsUsed, 2);
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：容量不足时未排件列出，已排件不受影响', () => {
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 1000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1000, L: 1000, defects: [], locked: [] },
+  ];
+  const pieces = [];
+  for (let i = 0; i < 9; i++) pieces.push(mkRect('p' + i, 500, 500));
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.placements.length, 8, '两卷最多 8 件');
+  assert.strictEqual(result.unplaced.length, 1);
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：必用卷件不被自由件挤占（件数优先于卷数）', () => {
+  // 卷1 恰能被 4 件 500×500 自由件填满；必用卷件 R(600×400) 必须先落卷1，自由件溢出到卷2
+  const rolls = [
+    { key: 'R1', label: 1, W: 1000, L: 1000, defects: [], locked: [] },
+    { key: 'R2', label: 2, W: 1000, L: 1000, defects: [], locked: [] },
+  ];
+  const pieces = [
+    mkRect('R', 600, 400, { requiredRoll: 'R1' }),
+    mkRect('A', 500, 500), mkRect('B', 500, 500), mkRect('C', 500, 500), mkRect('D', 500, 500),
+  ];
+  const result = optimizeMulti({ rolls, pieces });
+  assert.strictEqual(result.unplaced.length, 0, '全部 5 件都应排入（不得为少启用卷而牺牲 R）');
+  const r = result.placements.find((p) => p.key === 'R');
+  assert.strictEqual(r.roll, 'R1', '必用卷件落在卷1');
+  assert.strictEqual(result.rollsUsed, 2);
+  verifyMulti({ rolls, pieces, result });
+});
+
+test('多卷：随机压力测试（不变量）', () => {
+  let seed = 99;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const rolls = [
+    { key: 'R1', label: 1, W: 1200, L: 3000, defects: [{ x: 500, y: 400, w: 150, h: 150 }], locked: [] },
+    { key: 'R2', label: 2, W: 1600, L: 4000, defects: [{ x: 100, y: 2000, w: 200, h: 100 }], locked: [] },
+    { key: 'R3', label: 3, W: 900, L: 2500, defects: [], locked: [] },
+  ];
+  const pieces = [];
+  for (let i = 0; i < 26; i++) {
+    const w = 100 + Math.floor(rnd() * 350);
+    const h = 100 + Math.floor(rnd() * 400);
+    const req = rnd() < 0.2 ? rolls[Math.floor(rnd() * 3)].key : null;
+    pieces.push(mkRect('r' + i, w, h, { allowRotate: rnd() < 0.5, requiredRoll: req }));
+  }
+  const result = optimizeMulti({ rolls, pieces });
+  verifyMulti({ rolls, pieces, result });
+  // 已排件数 + 未排件数 = 总件数
+  assert.strictEqual(result.placements.length + result.unplaced.length, pieces.length);
+  console.log(
+    `    （随机多卷：排入 ${result.placements.length}/26，启用 ${result.rollsUsed} 卷，总占用 ${result.usedLength}mm）`
+  );
+});
+
+// ---------------- 创建输入校验（多卷） ----------------
+console.log('创建输入校验（多卷）');
+
+test('多卷格式创建通过，旧字段为各卷最大值', () => {
+  const { errors, value } = validateJobInput({
+    name: 't',
+    rolls: [
+      { width: 1600, length: 5000, defects: [{ x: 10, y: 10, w: 50, h: 50 }] },
+      { width: 1400, length: 4000, defects: [] },
+    ],
+    pieces: [{ name: 'a', vertices: rect(0, 0, 100, 100), quantity: 1, allowRotate: false }],
+  });
+  assert.deepStrictEqual(errors, []);
+  assert.strictEqual(value.rolls.length, 2);
+  assert.strictEqual(value.fabricWidth, 1600);
+  assert.strictEqual(value.fabricLength, 5000);
+  assert.strictEqual(value.rolls[0].defects.length, 1);
+});
+
+test('旧单卷格式兼容：归一为一卷', () => {
+  const { errors, value } = validateJobInput({
+    name: 'legacy',
+    fabricWidth: 1600,
+    fabricLength: 5000,
+    defects: [{ x: 0, y: 0, w: 10, h: 10 }],
+    pieces: [{ name: 'a', vertices: rect(0, 0, 100, 100), quantity: 2 }],
+  });
+  assert.deepStrictEqual(errors, []);
+  assert.strictEqual(value.rolls.length, 1);
+  assert.strictEqual(value.rolls[0].width, 1600);
+  assert.strictEqual(value.rolls[0].defects.length, 1);
+});
+
+test('无效必用卷号被明确拒绝', () => {
+  const { errors } = validateJobInput({
+    rolls: [{ width: 1000, length: 1000 }],
+    pieces: [{ name: 'a', vertices: rect(0, 0, 100, 100), quantity: 1, requiredRoll: 2 }],
+  });
+  assert(errors.length === 1 && /必用卷号/.test(errors[0]) && /无效/.test(errors[0]), errors.join(';'));
+});
+
+test('宽度容不下裁片的必用卷约束被明确拒绝', () => {
+  const { errors } = validateJobInput({
+    rolls: [{ width: 300, length: 5000 }, { width: 1000, length: 5000 }],
+    pieces: [{ name: 'a', vertices: rect(0, 0, 500, 100), quantity: 1, requiredRoll: 1 }],
+  });
+  assert(errors.length === 1 && /必用卷1/.test(errors[0]) && /容不下/.test(errors[0]), errors.join(';'));
+});
+
+test('没有任何一卷容得下的裁片被拒绝', () => {
+  const { errors } = validateJobInput({
+    rolls: [{ width: 300, length: 5000 }, { width: 500, length: 5000 }],
+    pieces: [{ name: 'a', vertices: rect(0, 0, 600, 100), quantity: 1 }],
+  });
+  assert(errors.length === 1 && /没有任何一卷容得下/.test(errors[0]), errors.join(';'));
+});
+
+test('瑕疵超出所属卷范围被拒绝并指明卷号', () => {
+  const { errors } = validateJobInput({
+    rolls: [{ width: 1000, length: 1000, defects: [{ x: 900, y: 0, w: 200, h: 10 }] }],
+    pieces: [{ name: 'a', vertices: rect(0, 0, 100, 100), quantity: 1 }],
+  });
+  assert(errors.length === 1 && /卷1瑕疵区#1/.test(errors[0]), errors.join(';'));
 });
 
 console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
